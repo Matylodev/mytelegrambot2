@@ -1,0 +1,261 @@
+# bot.py — aiogram v2, File Handling Upgrade (Level A)
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+# --- config (read from env if available) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_IF_LOCAL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5149455225"))
+DB_PATH = os.getenv("DB_PATH", "database.db")
+UPLOAD_DIR = Path("uploads")
+ALLOWED_EXT = {".ex4", ".ex5", ".mq4", ".mq5"}
+URL_REGEX = re.compile(r"https?://\S+")
+
+# create upload dir
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+# ---------- Database helpers ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        fullname TEXT,
+        balance REAL DEFAULT 0,
+        joined_at TEXT,
+        ref_by INTEGER
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        fullname TEXT,
+        service TEXT,
+        file_id TEXT,
+        file_name TEXT,
+        saved_path TEXT,
+        seller_link TEXT,
+        status TEXT DEFAULT 'pending',
+        admin_msg_id INTEGER,
+        created_at TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS withdraws (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT
+    )""")
+    conn.commit()
+    conn.close()
+
+def ensure_user(user: types.User):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE id=?", (user.id,))
+    if not cur.fetchone():
+        fullname = f"{user.first_name or ''} {user.last_name or ''}".strip()
+        cur.execute("INSERT INTO users (id, username, fullname, balance, joined_at) VALUES (?, ?, ?, ?, ?)",
+                    (user.id, user.username or "", fullname, 0, datetime.utcnow().isoformat()))
+        conn.commit()
+    conn.close()
+
+def add_submission(user: types.User, service: str, file_id: str = None, file_name: str = None, saved_path: str = None, seller_link: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    created = datetime.utcnow().isoformat()
+    cur.execute("""INSERT INTO submissions (user_id, username, fullname, service, file_id, file_name, saved_path, seller_link, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user.id, user.username or "", f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                 service, file_id, file_name, saved_path, seller_link, created))
+    sub_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return sub_id
+
+def set_submission_admin_msg(sub_id: int, admin_msg_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE submissions SET admin_msg_id = ? WHERE id = ?", (admin_msg_id, sub_id))
+    conn.commit()
+    conn.close()
+
+def get_submission(sub_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, file_name, saved_path FROM submissions WHERE id=?", (sub_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def list_pending():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, username, fullname, service, file_name, seller_link, created_at FROM submissions WHERE status='pending'")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# ---------- Keyboards ----------
+def main_menu():
+    buttons = [
+        ["Unlock EX5", "Unlock EX4"],
+        ["Decompile EX5", "Decompile EX4"],
+        ["Edit Comments"],
+        ["Convert MQ5 to MQ4", "Convert MQ4 to MQ5"],
+        ["Check File", "Check Broken"],
+        ["Contact Us", "About Us"],
+        ["Help"]
+    ]
+    kb = ReplyKeyboardMarkup([[KeyboardButton(text=b) for b in row] for row in buttons], resize_keyboard=True)
+    return kb
+
+def is_allowed_file(filename: str):
+    if not filename:
+        return False
+    return any(filename.lower().endswith(ext) for ext in ALLOWED_EXT)
+
+# ---------- Handlers ----------
+@dp.message_handler(commands=['start'])
+async def start_command(message: types.Message):
+    ensure_user(message.from_user)
+    await message.answer("👋 Welcome!\nChoose a service below.", reply_markup=main_menu())
+
+@dp.message_handler(content_types=types.ContentType.DOCUMENT)
+async def handle_document(message: types.Message):
+    user = message.from_user
+    ensure_user(user)
+
+    doc = message.document
+    orig_name = doc.file_name or "unknown"
+    if not is_allowed_file(orig_name):
+        await message.reply("❌ Invalid file type. Allowed: " + ", ".join(ALLOWED_EXT))
+        return
+
+    # build safe filename
+    timestamp = int(time.time())
+    safe_name = f"{user.id}_{timestamp}_{orig_name}"
+    saved_path = UPLOAD_DIR / safe_name
+
+    # download file
+    await doc.download(destination_file=str(saved_path))
+
+    # record submission
+    sub_id = add_submission(user, service="file_upload", file_id=doc.file_id, file_name=orig_name, saved_path=str(saved_path))
+
+    # forward original message to admin so admin can download directly from Telegram
+    forwarded = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+
+    # send admin caption that contains submission ID
+    admin_caption = (f"📥 New Submission #{sub_id}\nUser: {user.id} (@{user.username or 'no'})\nFile: {orig_name}\nSaved as: {saved_path}")
+    admin_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_caption)
+
+    # store admin_msg_id
+    set_submission_admin_msg(sub_id, admin_msg.message_id if admin_msg else None)
+
+    # confirm to user
+    await message.reply(f"✅ File received and saved (ID: {sub_id}). Admin has been notified. We'll contact you when it's processed.")
+
+@dp.message_handler(lambda m: m.text and URL_REGEX.search(m.text))
+async def handle_seller_link(message: types.Message):
+    user = message.from_user
+    ensure_user(user)
+    link = URL_REGEX.search(message.text).group(0)
+    sub_id = add_submission(user, service="seller_link", seller_link=link)
+    admin_text = f"📥 New Link Submission #{sub_id}\nUser: {user.id} (@{user.username or 'no'})\nLink: {link}"
+    admin_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+    set_submission_admin_msg(sub_id, admin_msg.message_id if admin_msg else None)
+    await message.reply("✅ Link received and forwarded to admin for review.")
+
+# Admin replies to the admin caption message -> forwarded to original user
+@dp.message_handler(lambda m: m.reply_to_message and m.from_user and m.from_user.id == ADMIN_ID, content_types=types.ContentType.ANY)
+async def admin_reply_handler(message: types.Message):
+    # admin must reply to the bot's admin caption (which contains #<id>)
+    replied = message.reply_to_message
+    text = replied.text or ""
+    m = re.search(r"#(\d+)", text)
+    if not m:
+        await message.reply("⚠️ Could not find submission ID in replied message. Reply to the admin caption that contains the #ID.")
+        return
+    sub_id = int(m.group(1))
+    row = get_submission(sub_id)
+    if not row:
+        await message.reply("Submission not found.")
+        return
+    _, user_id, file_name, saved_path = row
+
+    # forward admin message to user
+    try:
+        if message.text:
+            await bot.send_message(chat_id=user_id, text=f"💬 Admin: {message.text}")
+        elif message.document:
+            await bot.send_document(chat_id=user_id, document=message.document.file_id, caption="💬 Admin replied with file")
+        elif message.photo:
+            await bot.send_photo(chat_id=user_id, photo=message.photo[-1].file_id, caption="💬 Admin replied with photo")
+        else:
+            # fallback: copy the message
+            await message.copy_to(chat_id=user_id)
+        await message.reply("✅ Forwarded to user.")
+    except Exception as e:
+        await message.reply(f"❌ Failed to send to user: {e}")
+
+# Admin tools
+@dp.message_handler(commands=['pending'])
+async def cmd_pending(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = list_pending()
+    if not rows:
+        await message.reply("No pending submissions.")
+        return
+    out = ""
+    for r in rows:
+        sid, uid, username, fullname, service, fname, link, created = r
+        out += f"ID:{sid} User:{uid} File:{fname or '-'} Link:{link or '-'} Created:{created}\n---\n"
+    for chunk in [out[i:i+4000] for i in range(0, len(out), 4000)]:
+        await message.reply(chunk)
+
+@dp.message_handler(commands=['resolve'])
+async def cmd_resolve(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /resolve <submission_id>")
+        return
+    try:
+        sid = int(parts[1])
+    except:
+        await message.reply("Invalid id")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE submissions SET status='resolved' WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+    await message.reply(f"Submission {sid} marked resolved.")
+
+# error handler
+@dp.errors_handler()
+async def on_error(update, exception):
+    print("ERROR:", exception)
+    return True
+
+# run
+if __name__ == "__main__":
+    init_db()
+    print("Bot started (File Handling Upgrade A).")
+    executor.start_polling(dp, skip_updates=True)
